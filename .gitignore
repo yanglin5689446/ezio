@@ -38,3 +38,13 @@
 /utils/initrd.img
 /utils/initrd.img.tmp
 /utils/tmp/
+
+# proto
+*.pb.cc
+*.pb.h
+*_pb2.py
+*_pb2_grpc.py
+
+# Python
+__pycache__/
+*.py[cod]

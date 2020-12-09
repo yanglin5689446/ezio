@@ -4,11 +4,6 @@
 #include <getopt.h>
 #include <stddef.h>
 
-#ifdef __linux__
-#include <sys/sysinfo.h>
-#define RAM_2G (2UL * 1024 * 1024 * 1024)
-#endif
-
 #include <libtorrent/session.hpp>
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/torrent_handle.hpp>
@@ -24,302 +19,111 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 
 #include "logger.hpp"
+#include "raw_storage.hpp"
+#include "config.hpp"
+#ifdef ENABLE_GRPC
+#include "service.hpp"
+#endif
 
 namespace lt = libtorrent;
 
+/*
 int timeout_ezio = 15; // Default timeout (min)
 int seed_limit_ezio = 3; // Default seeding ratio limit
 int max_upload_ezio = 4;
 int max_connection_ezio = max_upload_ezio + 2;
-int max_contact_tracker_times = 30; // Max error times for scrape tracker
-
-struct raw_storage : lt::storage_interface {
-	raw_storage(lt::file_storage const& fs, const std::string tp) : m_files(fs), target_partition(tp) {}
-	// Open disk fd
-	void initialize(lt::storage_error& se)
-	{
-		this->fd = open(target_partition.c_str(), O_RDWR | O_CREAT);
-		if(this->fd < 0){
-			// Failed handle
-			std::cerr << "Failed to open " << target_partition << std::endl;
-
-			// TODO exit
-		}
-		return;
-	}
-
-	// assume no resume
-	bool has_any_file(lt::storage_error& ec) { return false; }
-
-	int readv(lt::file::iovec_t const* bufs, int num_bufs, int piece, int offset, int flags, lt::storage_error& ec)
-	{
-		int index = 0;
-		int i = 0;
-		int ret = 0;
-		unsigned long long device_offset = 0;
-		unsigned long long fd_offset = 0; // A fd' point we read data from fd from 
-		unsigned long long cur_offset = 0; // A pieces' point we have to write data until
-		unsigned long long remain_len = 0;
-		unsigned long long piece_sum = 0;
-		unsigned long long data_len = 0;
-		char *data_buf, *data_ptr = NULL;
-		char filename[33]; // Should be the max length of file name
-
-		// Get file name from offset
-		index = m_files.file_index_at_offset( piece * std::uint64_t(m_files.piece_length()) + offset);
-		memcpy( filename, m_files.file_name_ptr(index), m_files.file_name_len(index));
-		filename[m_files.file_name_len(index)] = 0;
-		sscanf(filename,"%llx", &device_offset);
-
-		// Caculate total piece size of previous files
-		for( i = 0 ; i < index; i++ )
-			piece_sum += m_files.file_size(i);
-
-		// Caculate the length of all bufs
-		for( i = 0 ; i < num_bufs ; i ++){
-			data_len += bufs[i].iov_len;
-		}
-		data_buf = (char *)malloc(data_len);
-
-		// Read fd to data_buf
-		cur_offset = piece * std::uint64_t(m_files.piece_length()) + offset;
-		fd_offset = device_offset + offset + piece * std::uint64_t(m_files.piece_length()) - piece_sum;
-		remain_len = m_files.file_size(index) - (offset + piece * std::uint64_t(m_files.piece_length()) - piece_sum);
-		data_ptr = data_buf;
-		while(data_len > 0){
-			if( data_len > remain_len ){
-				ret += pread(this->fd, data_ptr, remain_len, fd_offset);
-				data_len -= remain_len;
-				data_ptr += remain_len;
-				cur_offset += remain_len;
-				index = m_files.file_index_at_offset( cur_offset );
-				memcpy( filename, m_files.file_name_ptr(index), m_files.file_name_len(index));
-				filename[m_files.file_name_len(index)] = 0;
-				sscanf(filename,"%llx", &fd_offset);
-				remain_len = m_files.file_size(index);
-			}
-			else{
-				ret += pread(this->fd, data_ptr, data_len, fd_offset);
-				data_len -= data_len;
-			}
-		}
-
-		// Copy data_buf to bufs
-		data_ptr = data_buf;
-		for( i = 0 ; i < num_bufs ; i ++){
-			memcpy(bufs[i].iov_base, data_ptr, bufs[i].iov_len);
-			data_ptr += bufs[i].iov_len;
-		}
-
-		free(data_buf);
-		return ret;
-	}
-
-	int writev(lt::file::iovec_t const* bufs, int num_bufs, int piece, int offset, int flags, lt::storage_error& ec)
-	{
-		int index = 0;
-		int i = 0;
-		int ret = 0;
-		unsigned long long device_offset = 0;
-		unsigned long long fd_offset = 0; // A fd' point we write data to fd from 
-		unsigned long long cur_offset = 0; // A pieces' point we have to read data until
-		unsigned long long remain_len = 0;
-		unsigned long long piece_sum = 0;
-		unsigned long long data_len = 0;
-		char *data_buf = NULL, *data_ptr = NULL;
-		char filename[33]; // Should be the max length of file name
-
-		// Get file name from offset
-		index = m_files.file_index_at_offset( piece * std::uint64_t(m_files.piece_length()) + offset);
-		memcpy( filename, m_files.file_name_ptr(index), m_files.file_name_len(index));
-		filename[m_files.file_name_len(index)] = 0;
-		sscanf(filename,"%llx", &device_offset);
-
-		// Caculate total piece size of previous files
-		for( i = 0 ; i < index; i++ )
-			piece_sum += m_files.file_size(i);
-
-		// Caculate the length of all bufs
-		for( i = 0 ; i < num_bufs ; i ++){
-			data_len += bufs[i].iov_len;
-		}
-
-		// Merge all bufs into data_buf
-		data_buf = (char *)malloc(data_len);
-		data_ptr = data_buf;
-		for( i = 0 ; i < num_bufs ; i ++){
-			memcpy(data_ptr, bufs[i].iov_base, bufs[i].iov_len);
-			data_ptr += bufs[i].iov_len;
-		}
-
-		// Write data_buf to fd
-		cur_offset = piece * std::uint64_t(m_files.piece_length()) + offset;
-		fd_offset = device_offset + offset + piece * std::uint64_t(m_files.piece_length()) - piece_sum;
-		remain_len = m_files.file_size(index) - (offset + piece * std::uint64_t(m_files.piece_length()) - piece_sum);
-		data_ptr = data_buf;
-		while(data_len > 0){
-			if( data_len > remain_len ){
-				ret += pwrite(this->fd, data_ptr, remain_len, fd_offset);
-				data_len -= remain_len;
-				data_ptr += remain_len;
-				cur_offset += remain_len;
-				index = m_files.file_index_at_offset( cur_offset );
-				memcpy( filename, m_files.file_name_ptr(index), m_files.file_name_len(index));
-				filename[m_files.file_name_len(index)] = 0;
-				sscanf(filename,"%llx", &fd_offset);
-				remain_len = m_files.file_size(index);
-			}
-			else{
-				ret += pwrite(this->fd, data_ptr, data_len, fd_offset);
-				data_len -= data_len;
-			}
-		}
-		free(data_buf);
-		return ret;
-	}
-
-	// Not need
-	void rename_file(int index, std::string const& new_filename, lt::storage_error& ec)
-	{ assert(false); return ; }
-
-	int move_storage(std::string const& save_path, int flags, lt::storage_error& ec) { return 0; }
-	bool verify_resume_data(lt::bdecode_node const& rd
-					, std::vector<std::string> const* links
-					, lt::storage_error& error) { return false; }
-	void write_resume_data(lt::entry& rd, lt::storage_error& ec) const { return ; }
-	void set_file_priority(std::vector<boost::uint8_t> const& prio, lt::storage_error& ec) {return ;}
-	void release_files(lt::storage_error& ec) { return ; }
-	void delete_files(int i, lt::storage_error& ec) { return ; }
-
-	bool tick () { return false; };
-
-
-	lt::file_storage m_files;
-	int fd;
-	const std::string target_partition;
-};
-
-
-lt::storage_interface* raw_storage_constructor(lt::storage_params const& params)
-{
-	return new raw_storage(*params.files, params.path);
-}
-
-void usage()
-{
-      std::cerr << "Usage: ezio [OPTIONS] <magnet-url/torrent-file> <target-partition-path>\n"
-                << "OPTIONS:\n"
-                << "	-e N: assign seeding ratio limit as N. Default value is " << seed_limit_ezio <<"\n"
-                << "	-k N: assign maxminum failure number to contact tracker as N. Default value is " << max_contact_tracker_times<< "\n"
-                << "	-m N: assign maxminum upload number as N. Default value is " << max_upload_ezio <<"\n"
-                << "	-c N: assign maxminum connection number as N. Default value is " << max_upload_ezio + 2 <<"\n"
-                << "	-s: enable sequential download\n"
-                << "	-t N: assign timeout as N min(s). Default value " << timeout_ezio <<"\n"
-                << "	-l file: assign log file"
-      		<< std::endl;
-}
+*/
 
 int main(int argc, char ** argv)
 {
-	lt::add_torrent_params atp;
-	int opt;
-	int opt_n = 0;
-	int seq_flag = 0;
+
+	// need to remove
 	int log_flag = 0;
-	std::string logfile = "";
 
-	opterr = 0;
-	while (( opt = getopt (argc, argv, "e:m:c:st:l:")) != -1)
-	  switch (opt)
-	    {
-	    case 'e':
-	      seed_limit_ezio = atoi(optarg);
-	      ++opt_n;
-	      ++opt_n;
-	      break;
-	    case 'm':
-	      max_upload_ezio = atoi(optarg);
-	      ++opt_n;
-	      ++opt_n;
-	      break;
-	    case 'c':
-	      max_connection_ezio = atoi(optarg);
-	      ++opt_n;
-	      ++opt_n;
-	      break;
-	    case 's':
-	      seq_flag = 1;
-	      ++opt_n;
-	      break;
-	    case 't':
-	      timeout_ezio = atoi(optarg);
-	      ++opt_n;
-	      ++opt_n;
-	      break;
-	    case 'l':
-              logfile = optarg;
-              log_flag = 1;
-              ++opt_n;
-              ++opt_n;
-	      break;
-	    case '?':
-	      usage();
-	      return 1;
-	    default:
-	      usage();
-	      exit(EXIT_FAILURE);
-	}
-
-	if (argc - opt_n != 3) {
-		usage();
-		return 1;
-	}
-	std::string bt_info = argv[optind];
-	++optind;;
-	atp.save_path = argv[optind];
-
-	if (seq_flag) {
-	  std::cout << "//NOTE// Sequential download is enabled!" << std::endl;
-	}
+	config current;
+	current.parse_from_argv(argc, argv);
 
 	lt::session ses;
 	lt::error_code ec;
 	lt::settings_pack set;
 
 	// setting
+	lt::high_performance_seed(set);
 	// we don't need DHT
 	set.set_bool(lt::settings_pack::enable_dht, false);
-#ifdef __linux__
-	// Determine Physical Ram Size
-	// if more than 2GB, set cache to half of Ram
-	struct sysinfo info;
-	if(sysinfo(&info) == 0) {
-		unsigned long totalram = info.totalram * info.mem_unit;
-		if(totalram > RAM_2G) {
-			// unit: blocks per 16KiB
-			int size = (int)(totalram / 16 / 1024 / 2);
-			set.set_int(lt::settings_pack::cache_size, size);
-		}
+
+	// tuning cache
+	set.set_bool(lt::settings_pack::volatile_read_cache, true);
+	set.set_int(lt::settings_pack::suggest_mode, lt::settings_pack::suggest_read_cache);
+	set.set_int(lt::settings_pack::send_buffer_watermark, 128 * 1024 * 1024);
+	set.set_int(lt::settings_pack::send_buffer_watermark_factor, 150);
+	set.set_int(lt::settings_pack::send_buffer_low_watermark, 40 * 1024 * 1024);
+
+	// threads
+	set.set_int(lt::settings_pack::aio_threads, 16);
+
+	// Cache size if non-zero, in KiB
+	// TODO change unit to MiB
+	if(current.cache_size >= 0) {
+		int size = (int)(current.cache_size / 16);
+		set.set_int(lt::settings_pack::cache_size, size);
 	}
-#endif
+
+	// apply seeting to libtorrent
 	ses.apply_settings(set);
 
-	// magnet or torrent
-	// TODO find a better way
-	if(bt_info.substr(bt_info.length() - 8, 8) == ".torrent"){
-		atp.ti = boost::make_shared<lt::torrent_info>(bt_info, boost::ref(ec), 0);
-	}
-	else{
-		atp.url = bt_info;
-	}
-	atp.storage = raw_storage_constructor;
+#ifdef ENABLE_GRPC
+	gRPCService grpcservice(ses, current.listen_address);
+#endif
 
-	lt::torrent_handle handle = ses.add_torrent(atp);
-	handle.set_max_uploads(max_upload_ezio);
-	handle.set_max_connections(max_connection_ezio);
-	handle.set_sequential_download(seq_flag);
-	//boost::progress_display show_progress(100, std::cout);
-	unsigned long last_progess = 0, progress = 0;
+	std::string logfile = "";
+	const boost::int64_t fileSizeLimit = 100 * 1024 * 1024;
+	char *buffer = (char*)malloc(fileSizeLimit);
+	for(auto torrent = current.torrents.begin(), save_path = current.save_paths.begin();
+			torrent != current.torrents.end() && save_path != current.save_paths.end();
+			torrent++, save_path++){
+		lt::add_torrent_params atp;
+		std::string bt_info = *torrent;
+		atp.save_path = *save_path;
+		if(current.seed_flag){
+			atp.flags |= lt::torrent_flags::seed_mode;
+		}
+
+		if (current.sequential_flag) {
+		  std::cout << "//NOTE// Sequential download is enabled!" << std::endl;
+		}
+
+		// magnet or torrent
+		// TODO find a better way
+		// TODO migrate to Libtorrent>=1.2.x
+		if(bt_info.substr(bt_info.length() - 8, 8) == ".torrent"){
+			FILE *fp = fopen(bt_info.c_str(), "rb");
+			boost::int64_t size = fread(buffer, 1, fileSizeLimit, fp);
+			const int depthLimit = 100;
+			const int tokenLimit = 10000000;
+			lt::bdecode_node node;
+			bdecode(buffer, buffer + size, node, ec, nullptr, depthLimit, tokenLimit);
+			atp.ti = std::make_shared<lt::torrent_info>(node, boost::ref(ec));
+			//atp.ti = boost::make_shared<lt::torrent_info>(bt_info, boost::ref(ec), 0);
+			//std::cerr << "test" << ec << std::endl;
+		}
+		else{
+			atp.url = bt_info;
+		}
+
+		if(current.file_flag == 0){
+			atp.storage = raw_storage::raw_storage_constructor;
+		}
+
+		lt::torrent_handle handle = ses.add_torrent(atp);
+		handle.set_max_uploads(current.max_upload_ezio);
+		handle.set_max_connections(current.max_connection_ezio);
+		handle.set_sequential_download(current.sequential_flag);
+
+	}
+	free(buffer);
+
+	unsigned long progress = 0;
 	lt::torrent_status status;
 
 	Logger *log;
@@ -330,20 +134,29 @@ int main(int argc, char ** argv)
 
 	std::cout << "Start downloading" << std::endl;
 
+	auto torrents = ses.get_torrents();
 	for(;;){
 		std::vector<lt::alert*> alerts;
 		ses.pop_alerts(&alerts);
 
-		status = handle.status();
+		int download_rate = 0, upload_rate = 0;
+		progress = 0;
+		for(auto handle : torrents){
+			handle.force_reannounce();
+			status = handle.status();
+			download_rate += status.download_payload_rate;
+			upload_rate += status.upload_payload_rate;
+			progress += status.progress * 100;
+		}
 		// progress
-		last_progess = progress;
-		progress = status.progress * 100;
+		progress /= torrents.size();
+		status = torrents[0].status();
 		//show_progress += progress - last_progess;
-		std::cout << "\r"
+		std::cout << std::fixed << "\r"
 			<< "[P: " << progress << "%] "
-			<< "[D: " << std::setprecision(2) << (float)status.download_payload_rate / 1024 / 1024 /1024 * 60 << " GB/min] "
+			<< "[D: " << std::setprecision(2) << (float)download_rate / 1024 / 1024 /1024 * 60 << " GB/min] "
 			<< "[DT: " << (int)status.active_time  << " secs] "
-			<< "[U: " << std::setprecision(2) << (float)status.upload_payload_rate / 1024 / 1024 /1024 *60 << " GB/min] "
+			<< "[U: " << std::setprecision(2) << (float)upload_rate / 1024 / 1024 /1024 * 60 << " GB/min] "
 			<< "[UT: " << (int)status.seeding_time  << " secs] "
 			<< std::flush;
 
@@ -354,7 +167,7 @@ int main(int argc, char ** argv)
 			log->info() << "upload_payload_rate=" << status.upload_payload_rate << std::endl;
 
 			std::vector<lt::peer_info> peers;
-			handle.get_peer_info(peers);
+			//handle.get_peer_info(peers);
 
 			for (auto peer : peers) {
 				log->info() << "ip=" << peer.ip.address().to_string() << std::endl
@@ -367,79 +180,136 @@ int main(int argc, char ** argv)
 			// std::cout << a->message() << std::endl;
 			// if we receive the finished alert or an error, we're done
 			if (lt::alert_cast<lt::torrent_finished_alert>(a)) {
-				goto done;
-			}
-			if (status.is_finished) {
-				goto done;
+				// check all torrents
+				bool all_done = true;
+				for(auto handle : torrents){
+					status = handle.status();
+					if(!status.is_finished){
+						all_done = false;
+						break;
+					}
+				}
+				if(all_done){
+					goto done;
+				}
 			}
 			if (lt::alert_cast<lt::torrent_error_alert>(a)) {
 				std::cerr << "Error" << std::endl;
+				std::cerr << a->what() << std::endl;
+				std::cerr << a->message() << std::endl;
 				return 1;
 			}
 		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+		// check all torrents
+		bool all_done = true;
+		for(auto handle : torrents){
+			status = handle.status();
+			if(!status.is_finished){
+				all_done = false;
+				break;
+			}
+		}
+		if(all_done){
+			goto done;
+		}
+
+		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 	done:
 	std::cout << std::endl;
 
+	// display avg download speed
+	for (auto handle : torrents) {
+		status = handle.status();
+		if (status.active_time == 0)
+			continue;
+		std::cout << std::fixed << std::setprecision(2)
+			<< std::endl
+			<< "Avg D: " << (double)status.total_done / 1024 / 1024 / 1024 / status.active_time * 60 << " GB/min, "
+			<< (double)status.total_done / 1024 / 1024 / status.active_time  << " MB/s" << std::endl;
+	}
 
 	// Start high performance seed
-	lt::high_performance_seed(set);
 	ses.apply_settings(set);
-	std::cout << "Start high-performance seeding" << std::endl;
 
 	// seed until idle (secs)
-	int timeout = timeout_ezio * 60;
+	int timeout = current.timeout_ezio * 60;
 
 	// seed until seed rate
-	boost::int64_t seeding_rate_limit = seed_limit_ezio;
-	boost::int64_t total_size = handle.torrent_file()->total_size();
+	boost::int64_t seeding_rate_limit = current.seed_limit_ezio;
 
-	int fail_contact_tracker = 0;
+	// wait for seed mode to start
+	std::this_thread::sleep_for(std::chrono::seconds(3));
+
+	torrents = ses.get_torrents();
+
 	for (;;) {
-		status = handle.status();
-		int utime = status.time_since_upload;
-		int dtime = status.time_since_download;
-		boost::int64_t total_payload_upload = status.total_payload_upload;
-		// ses.set_alert_mask(lt::alert::tracker_notification | lt::alert::error_notification);
-		std::vector<lt::alert*> alerts;
-		ses.pop_alerts(&alerts);
-
-		std::cout << "\r"
+		int upload_rate = 0;
+		int seeding_time = 0;
+		for(auto handle : torrents){
+			handle.force_reannounce();
+			status = handle.status();
+			upload_rate += status.upload_payload_rate;
+			seeding_time = status.seeding_time > seeding_time ? status.seeding_time : seeding_time;
+		}
+		std::cout << std::fixed << "\r"
 			/*
 			<< "[P: " << progress << "%] "
 			<< "[D: " << std::setprecision(2) << (float)status.download_payload_rate / 1024 / 1024 /1024 * 60 << " GB/min] "
 			<< "[T: " << (int)status.active_time  << " secs] "
 			*/
-			<< "[U: " << std::setprecision(2) << (float)status.upload_payload_rate / 1024 / 1024 /1024 * 60 << " GB/min] "
-			<< "[T: " << (int)status.seeding_time  << " secs] "
+			<< "[U: " << std::setprecision(2) << (float)upload_rate / 1024 / 1024 /1024 * 60 << " GB/min] "
+			<< "[T: " << (int)seeding_time  << " secs] "
+			//<< status.state
 			<< std::flush;
 
-		if(utime == -1 && timeout < dtime){
-			break;
-		}
-		else if(timeout < utime){
-			break;
-		}
-		else if(seeding_rate_limit < (total_payload_upload / total_size)){
-			break;
-		}
+		bool all_done = true;
+		for(auto handle : torrents){
+			status = handle.status();
+			int utime = status.time_since_upload;
+			int dtime = status.time_since_download;
+			boost::int64_t total_size = handle.torrent_file()->total_size();
+			boost::int64_t total_payload_upload = status.total_payload_upload;
 
-		handle.scrape_tracker();
-		for (lt::alert const* a : alerts) {
-			if (lt::alert_cast<lt::scrape_failed_alert>(a)) {
-				++fail_contact_tracker;;
+			handle.scrape_tracker();
+
+			// in force seed mode, never pause any torrent
+			if(current.seed_flag){
+				all_done = false;
+				continue;
+			}
+
+			// we don't need to check who is paused already
+			if(status.paused){
+				continue;
+			}
+
+			all_done = false;
+			if(utime == -1 && timeout < dtime){
+				handle.auto_managed(false);
+				handle.pause();
+			}
+			else if(timeout < utime){
+				handle.auto_managed(false);
+				handle.pause();
+			}
+			else if(seeding_rate_limit < (total_payload_upload / total_size)){
+				handle.auto_managed(false);
+				handle.pause();
 			}
 		}
-
-		if(fail_contact_tracker > max_contact_tracker_times){
-	                std::cout << "\nTracker is gone! Finish seeding!" << std::endl;
-			break;
+		if(all_done){
+			goto finish;
 		}
 
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
+	finish:
 	std::cout << "\nDone, shutting down" << std::endl;
+
+#ifdef ENABLE_GRPC
+	grpcservice.stop();
+#endif
 
 	return 0;
 }
